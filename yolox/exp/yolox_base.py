@@ -38,7 +38,7 @@ class Exp(BaseExp):
         # You can uncomment this line to specify a multiscale range
         # self.random_size = (14, 26)
         # dir of dataset images, if data_dir is None, this project will use `datasets` dir
-        self.data_dir = None
+        self.data_dir = '/DATA_17/DATASET/coco2017'
         # name of annotation file for training
         self.train_ann = "instances_train2017.json"
         # name of annotation file for evaluation

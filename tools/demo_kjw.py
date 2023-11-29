@@ -4,7 +4,10 @@
 
 import argparse
 import os
+# os.environ["CUDA_VISIBLE_DEVICSE"]='4'
+from pathlib import Path
 import time
+from tqdm import tqdm
 from loguru import logger
 
 import cv2
@@ -22,11 +25,11 @@ IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 def make_parser():
     parser = argparse.ArgumentParser("YOLOX Demo!")
     parser.add_argument(
-        "demo", default="image", help="demo type, eg. image, video and webcam"
+        "--demo", default="image", help="demo type, eg. image, video and webcam"
     )
-    parser.add_argument("-expn", "--experiment-name", type=str, default='inference_test')
+    parser.add_argument("-expn", "--experiment-name", type=str, default='labels')
     parser.add_argument("-n", "--name", type=str, default='yolox-x', help="model name")
-
+    parser.add_argument('--out_dir', default='YOLOX_outputs')
     parser.add_argument(
         "--path", default="/root/dataset/coco2017/images/val2017", help="path to images or video"
     )
@@ -36,7 +39,17 @@ def make_parser():
         action="store_true",
         help="whether to save the inference result of image/video",
     )
-
+    parser.add_argument(
+        "--save_txt",
+        action="store_true",
+        help="whether to save the inference result of image/video",
+    )
+    parser.add_argument(
+        "--device",
+        default="gpu",
+        type=str,
+        help="device to run our model, can either be cpu or gpu",
+    )
     # exp file
     parser.add_argument(
         "-f",
@@ -46,12 +59,7 @@ def make_parser():
         help="please input your experiment description file",
     )
     parser.add_argument("-c", "--ckpt", default='models/yolox_x.pth', type=str, help="ckpt for eval")
-    parser.add_argument(
-        "--device",
-        default="gpu",
-        type=str,
-        help="device to run our model, can either be cpu or gpu",
-    )
+
     parser.add_argument("--conf", default=0.25, type=float, help="test conf")  # 0.001
     parser.add_argument("--nms", default=0.3, type=float, help="test nms threshold")  # 0.3
     parser.add_argument("--tsize", default=None, type=int, help="test img size")
@@ -83,6 +91,13 @@ def make_parser():
         action="store_true",
         help="Using TensorRT model for testing.",
     )
+    parser.add_argument(
+        "--noise_std",
+        type=float,
+        default=0.1,
+        help="the spread or amplitude of the Gaussian noise distribution",
+    )
+    parser.add_argument('--classes', nargs='*', default=[0], type=int)
     return parser
 
 
@@ -108,6 +123,8 @@ class Predictor(object):
         device="cpu",
         fp16=False,
         legacy=False,
+        classes:list=[0],
+        noise_std=None
     ):
         self.model = model
         self.cls_names = cls_names
@@ -118,16 +135,10 @@ class Predictor(object):
         self.test_size = exp.test_size
         self.device = device
         self.fp16 = fp16
+        self.classes = classes
         self.preproc = ValTransform(legacy=legacy)
-        if trt_file is not None:
-            from torch2trt import TRTModule
+        self.noise = noise_std * 255
 
-            model_trt = TRTModule()
-            model_trt.load_state_dict(torch.load(trt_file))
-
-            x = torch.ones(1, 3, exp.test_size[0], exp.test_size[1]).cuda()
-            self.model(x)
-            self.model = model_trt
 
     def inference(self, img):
         img_info = {"id": 0}
@@ -152,6 +163,10 @@ class Predictor(object):
             img = img.cuda()
             if self.fp16:
                 img = img.half()  # to FP16
+        if self.noise:
+            noise = torch.randn_like(img) * self.noise
+            img = img + noise
+            img = torch.clamp(img, 0, 255)
 
         with torch.no_grad():
             t0 = time.time()
@@ -160,9 +175,9 @@ class Predictor(object):
                 outputs = self.decoder(outputs, dtype=outputs.type())
             outputs = postprocess(
                 outputs, self.num_classes, self.confthre,
-                self.nmsthre, class_agnostic=True
+                self.nmsthre, self.classes, class_agnostic=False, 
             )
-            logger.info("Infer time: {:.4f}s".format(time.time() - t0))
+            # logger.info("Infer time: {:.4f}s".format(time.time() - t0))
         return outputs, img_info
 
     def visual(self, output, img_info, cls_conf=0.35):
@@ -184,26 +199,53 @@ class Predictor(object):
         return vis_res
 
 
-def image_demo(predictor, vis_folder, path, current_time, save_result):
+def save_txt_file(txt_file, result):
+    texts = []
+    for d in result:
+        c, conf = int(d[-1]), float(d[4] * d[5])
+        line = (c, *d[:4].view(-1), conf)
+        texts.append(('%g ' * len(line)).rstrip() % line)
+    if texts:
+        Path(txt_file).parent.mkdir(parents=True, exist_ok=True)  # make directory
+        with open(txt_file, 'a') as f:
+            f.writelines(text + '\n' for text in texts)
+    
+
+def image_demo(predictor, out_dir, path, current_time, save_result, save_txt=None, noise=None):
     if os.path.isdir(path):
         files = get_image_list(path)
     else:
         files = [path]
     files.sort()
-    for image_name in files:
-        outputs, img_info = predictor.inference(image_name)
-        result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
-        if save_result:
-            save_folder = os.path.join(
-                vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-            )
-            os.makedirs(save_folder, exist_ok=True)
-            save_file_name = os.path.join(save_folder, os.path.basename(image_name))
-            logger.info("Saving detection result in {}".format(save_file_name))
-            cv2.imwrite(save_file_name, result_image)
-        ch = cv2.waitKey(0)
-        if ch == 27 or ch == ord("q") or ch == ord("Q"):
-            break
+    cnt = 0
+    if save_result or save_txt:
+        # txt_folder = os.path.join(out_dir, 'labels')
+        # vis_folder = os.path.join(save_folder, 'images')
+        save_folder = os.path.join(
+            out_dir, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
+        )
+        os.makedirs(save_folder,  exist_ok=True)
+        # save_folder = os.path.join(
+        #     out_dir, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
+        # )
+
+    for image_name in tqdm(files, desc='Inferecing', total=len(files), leave=True):
+        p = Path(image_name)
+        outputs, _ = predictor.inference(image_name)
+        if not outputs:
+            continue
+        cnt += 1
+        # if save_result:
+        #     result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
+        #     os.makedirs(vis_folder,  exist_ok=True)
+        #     save_file_name = os.path.join(vis_folder, p.name)
+        #     logger.info("Saving detection result in {}".format(save_file_name))
+        #     cv2.imwrite(save_file_name, result_image)
+        if save_txt:
+            txt_file = os.path.join(save_folder, p.stem + '.txt')
+            save_txt_file(txt_file, outputs[0])  # indexing '0' as there is only one image input
+    logger.info(f'Results saved to {Path(out_dir).resolve()}')
+    logger.info(f'{cnt} labels saved to {Path(save_folder).resolve()}')
 
 
 def imageflow_demo(predictor, vis_folder, current_time, args):
@@ -245,13 +287,14 @@ def main(exp, args):
     if not args.experiment_name:
         args.experiment_name = exp.exp_name
 
-    file_name = os.path.join(exp.output_dir, args.experiment_name)
-    os.makedirs(file_name, exist_ok=True)
+    file_name = Path(__file__).parents[-5].absolute() / args.out_dir / 'labels' / str(args.classes[0]) # os.path.join(exp.output_dir, args.experiment_name, str(args.classes[0]))
+    # os.makedirs(file_name, exist_ok=True)
+    Path(file_name).mkdir(parents=True, exist_ok=True)
 
-    vis_folder = None
-    if args.save_result:
-        vis_folder = os.path.join(file_name, "vis_res")
-        os.makedirs(vis_folder, exist_ok=True)
+    # vis_folder = None
+    # if args.save_result:
+    #     vis_folder = os.path.join(file_name, "vis_res")
+    #     os.makedirs(vis_folder, exist_ok=True)
 
     if args.trt:
         args.device = "gpu"
@@ -304,13 +347,13 @@ def main(exp, args):
 
     predictor = Predictor(
         model, exp, COCO_CLASSES, trt_file, decoder,
-        args.device, args.fp16, args.legacy,
+        args.device, args.fp16, args.legacy, args.classes, args.noise_std
     )
     current_time = time.localtime()
     if args.demo == "image":
-        image_demo(predictor, vis_folder, args.path, current_time, args.save_result)
+        image_demo(predictor, file_name, args.path, current_time, args.save_result, args.save_txt, noise=args.noise_std)
     elif args.demo == "video" or args.demo == "webcam":
-        imageflow_demo(predictor, vis_folder, current_time, args)
+        imageflow_demo(predictor, file_name, current_time, args)
 
 
 if __name__ == "__main__":

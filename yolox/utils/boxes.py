@@ -29,7 +29,7 @@ def filter_box(output, scale_range):
     return output[keep]
 
 
-def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45, class_agnostic=False):
+def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45, classes=None, class_agnostic=False):
     box_corner = prediction.new(prediction.shape)
     box_corner[:, :, 0] = prediction[:, :, 0] - prediction[:, :, 2] / 2
     box_corner[:, :, 1] = prediction[:, :, 1] - prediction[:, :, 3] / 2
@@ -50,6 +50,9 @@ def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45, class_agn
         # Detections ordered as (x1, y1, x2, y2, obj_conf, class_conf, class_pred)
         detections = torch.cat((image_pred[:, :5], class_conf, class_pred.float()), 1)
         detections = detections[conf_mask]
+        if classes is not None:
+            detections = detections[(detections[:, 6:7] == torch.tensor(classes, device=detections.device)).any(1)]
+        
         if not detections.size(0):
             continue
 
@@ -72,7 +75,10 @@ def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45, class_agn
             output[i] = detections
         else:
             output[i] = torch.cat((output[i], detections))
-
+    if output == [None]:
+        return []
+    # if len(output) != 1:
+    #     print(1)
     return output
 
 

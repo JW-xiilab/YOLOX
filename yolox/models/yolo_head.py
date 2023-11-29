@@ -33,7 +33,7 @@ class YOLOXHead(nn.Module):
         super().__init__()
 
         self.num_classes = num_classes
-        self.decode_in_inference = True  # for deploy, set to False
+        self.decode_in_inference = True  # TODO: Default = True, for deploy, set to False
 
         self.cls_convs = nn.ModuleList()
         self.reg_convs = nn.ModuleList()
